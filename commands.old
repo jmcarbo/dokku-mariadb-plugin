@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e; 
+set -e;
 
 # Check if name is specified
 if [[ $1 == mariadb:* ]]; then
@@ -24,19 +24,16 @@ case "$1" in
     # Check if DB container is installed
     IMAGE=$(docker images | grep "kloadut/mariadb " |  awk '{print $3}')
     if [[ -z $IMAGE ]]; then
-        echo "Mariadb image not found... Did you run 'dokku plugins-install' ?"
+        echo "MariaDB image not found... Did you run 'dokku plugins-install' ?"
         exit 1
     fi
     # Check if an existing DB volume exists
-    if [[ -d "$DOKKU_ROOT/mariadb-$APP" ]]; then
-        VOLUME="$DOKKU_ROOT/mariadb-$APP:/opt/mysql"
-        #VOLUME="$DOKKU_ROOT/postgresql-$APP"
+    if [[ -d "/var/lib/docker/volumes/mariadb-$APP" ]]; then
+        VOLUME="/var/lib/docker/volumes/mariadb-$APP/layer:/opt/mysql"
         echo
         echo "-----> Reusing mariadb/$APP database"
     else
-	mkdir -p "$DOKKU_ROOT/mariadb-$APP" 
-        chown dokku "$DOKKU_ROOT/mariadb-$APP"
-        VOLUME="$DOKKU_ROOT/mariadb-$APP:/opt/mysql"
+        VOLUME="/opt/mysql"
         # Generate a random password for DB user
         DB_PASSWORD=$(< /dev/urandom tr -dc A-Za-z0-9 | head -c 16)
         # Temporarily store it to a file
@@ -47,25 +44,29 @@ case "$1" in
         echo $DB_PASSWORD > "$DOKKU_ROOT/.mariadb/pwd_$APP"
         chown dokku: "$DOKKU_ROOT/.mariadb/pwd_$APP"
     fi
+    # Stop existing container with the same persistent DB
+    ID=$(docker ps | grep "$DB_IMAGE":latest |  awk '{print $1}')
+    if [[ ! -z "$ID" ]]; then
+        docker stop $ID > /dev/null
+    fi
     # Fork DB image
-    #ID=$(docker run -d kloadut/postgresql exit 0)
-    #docker wait $ID > /dev/null
-    #IMAGE=$(docker commit $ID)
-    #docker tag $IMAGE $DB_IMAGE
+    ID=$(docker run -d kloadut/mariadb exit 0)
+    docker wait $ID > /dev/null
+    IMAGE=$(docker commit $ID)
+    docker tag $IMAGE $DB_IMAGE
     # Launch container
-    docker run -v $VOLUME -p 3306 -d -name=mariadb-$APP kloadut/mariadb /usr/bin/start_mariadb.sh $DB_PASSWORD
-    echo "---------> mariadb-$APP container created"
-    #sleep 4
+    ID=$(docker run -v $VOLUME -p 3306 -d $DB_IMAGE /usr/bin/start_mariadb.sh $DB_PASSWORD)
+    sleep 4
     # Rename persistent volume
-    #if [[ ! -d "/var/lib/docker/volumes/postgresql-$APP" ]]; then
-    #    VOLUME_PATH=$(docker inspect $ID | grep "/var/lib/docker/volumes/" | awk '{print $2}' | sed -e"s/\/layer//" | sed -e's/"//g')
-    #    mv $VOLUME_PATH "/var/lib/docker/volumes/postgresql-$APP"
-    #    sleep 1
-    #fi
+    if [[ ! -d "/var/lib/docker/volumes/mariadb-$APP" ]]; then
+        VOLUME_PATH=$(docker inspect $ID | grep "/var/lib/docker/volumes/" | awk '{print $2}' | sed -e"s/\/layer//" | sed -e's/"//g')
+        mv $VOLUME_PATH "/var/lib/docker/volumes/mariadb-$APP"
+        sleep 1
+    fi
     # Link to a potential existing app
-    #dokku postgresql:link $APP $APP
+    dokku mariadb:link $APP $APP
     echo
-    echo "-----> Mariadb container created: $DB_IMAGE"
+    echo "-----> MariaDB container created: $DB_IMAGE"
     sleep 1
     dokku mariadb:info $APP
     ;;
@@ -73,17 +74,28 @@ case "$1" in
   mariadb:delete)
     DB_IMAGE=mariadb/$APP
     # Stop the container
-    docker stop mariadb-$APP
-    docker rm mariadb-$APP
+    ID=$(docker ps -a | grep "$DB_IMAGE":latest |  awk '{print $1}')
+    if [[ ! -z $ID ]]; then
+        docker stop $ID
+    fi
+    # Remove image
+    IMAGE=$(docker images | grep "$DB_IMAGE " |  awk '{print $1}')
+    if [[ ! -z $IMAGE ]]; then
+        docker rmi $IMAGE
+    fi
+    # Remove persistent volume
+    if [[ -d "/var/lib/docker/volumes/mariadb-$APP" ]]; then
+        rm -rf "/var/lib/docker/volumes/mariadb-$APP"
+    fi
     echo
-    echo "-----> Mariadb container deleted: $DB_IMAGE"
+    echo "-----> MariaDB container deleted: $DB_IMAGE"
     ;;
 
   mariadb:info)
     DB_IMAGE=mariadb/$APP
-    #ID=$(docker ps -a | grep "$DB_IMAGE":latest |  awk '{print $1}')
-    IP=$(docker inspect mariadb-$APP | grep IPAddress | awk '{ print $2 }' | tr -d ',"')
-    PORT=$(docker port mariadb-$APP 3306)
+    ID=$(docker ps -a | grep "$DB_IMAGE":latest |  awk '{print $1}')
+    IP=$(docker inspect $ID | grep IPAddress | awk '{ print $2 }' | tr -d ',"')
+    PORT=$(docker port $ID 3306)
     echo
     echo "       Host: $IP"
     echo "       User: 'root'"
@@ -96,7 +108,7 @@ case "$1" in
     ;;
 
   mariadb:link)
-    if [[ -d "$DOKKU_ROOT/$APP" ]]; then
+    if $APP_EXISTS; then
         # Check argument
         if [[ -z $3 ]]; then
             echo "You must specify a database name"
@@ -104,15 +116,15 @@ case "$1" in
         fi
         DB_IMAGE="mariadb/$3"
         # Check temporarily file
-    	if [[ ! -f "$DOKKU_ROOT/.mariadb/pwd_$APP" ]]; then
+        if [[ ! -f "$DOKKU_ROOT/.mariadb/pwd_$APP" ]]; then
             echo "Database is already linked"
-            exit 0
+            exit 1
         fi
         DB_PASSWORD=$(cat "$DOKKU_ROOT/.mariadb/pwd_$APP")
-        #ID=$(docker ps -a | grep "$DB_IMAGE":latest |  awk '{print $1}')
-        IP=$(docker inspect mariadb-$APP | grep IPAddress | awk '{ print $2 }' | tr -d ',"')
+        ID=$(docker ps -a | grep "$DB_IMAGE":latest |  awk '{print $1}')
+        IP=$(docker inspect $ID | grep IPAddress | awk '{ print $2 }' | tr -d ',"')
         # Write DATABASE_URL to app's ENV file
-        URL="DATABASE_URL=mysql://root:$DB_PASSWORD@$IP/db"
+        URL="DATABASE_URL=mysql2://root:$DB_PASSWORD@$IP/db"
         cat "$DOKKU_ROOT/$APP/ENV" | grep "$URL" || echo "export $URL" >> "$DOKKU_ROOT/$APP/ENV"
         echo
         echo "-----> $APP linked to $DB_IMAGE database"
@@ -122,8 +134,8 @@ case "$1" in
 
   mariadb:logs)
     DB_IMAGE=mariadb/$APP
-    #ID=$(docker ps -a | grep "$DB_IMAGE" |  awk '{print $1}')
-    docker logs mariadb-$APP | tail -n 100
+    ID=$(docker ps -a | grep "$DB_IMAGE" |  awk '{print $1}')
+    docker logs $ID | tail -n 100
     ;;
 
   help)
